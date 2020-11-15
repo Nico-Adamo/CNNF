@@ -15,10 +15,10 @@ from tensorboardX import SummaryWriter
 
 class CNNF(nn.Module):
     """ CNNF on an architecture with 4 Convs and 3 FCs. """
-    
+
     def __init__(self, num_classes, ind=0, cycles=2, res_param=0.1):
         super(CNNF, self).__init__()
-        
+
         self.ind = ind
         self.res_param = res_param
         self.cycles = cycles
@@ -44,21 +44,21 @@ class CNNF(nn.Module):
         self.flatten = layers.Flatten()
         self.fc1 = layers.Linear(3136, 1000)
         self.fc1_bias = layers.Bias((1,1000))
-        self.relu5 = layers.resReLU(res_param)  
+        self.relu5 = layers.resReLU(res_param)
         self.fc2 = layers.Linear(1000, 128)
         self.fc2_bias = layers.Bias((1,128))
-        self.relu6 = layers.resReLU(res_param)  
+        self.relu6 = layers.resReLU(res_param)
         self.fc3 = layers.Linear(128, num_classes)
         self.fc3_bias = layers.Bias((1,num_classes))
 
-    def forward(self, out, step='forward', first=True, inter=False, inter_recon=False):     
+    def forward(self, out, step='forward', first=True, inter=False, inter_recon=False):
         if ('forward' in step):
             if (self.ind == 0) or (first == True):
                 if (self.ind == 0) and (first == True):
                     orig_feature = out
                 out = self.ins1_bias(self.ins1(self.conv1(out)))
                 out = self.relu1(out)
-            if (self.ind <= 1) or (first == True):    
+            if (self.ind <= 1) or (first == True):
                 if (self.ind == 1) and (first == True):
                     orig_feature = out
                 out = self.ins2_bias(self.ins2(self.conv2(out)))
@@ -86,7 +86,7 @@ class CNNF(nn.Module):
             out = self.relu5(out, step='backward')
             out = self.fc1(out, step='backward')
             out = self.flatten(out, step='backward')
-            out = self.ins4(out) 
+            out = self.ins4(out)
             out = self.maxpool4(out, step='backward')
             out = self.relu4(out, step='backward')
             block2_recon = out
@@ -95,16 +95,16 @@ class CNNF(nn.Module):
             out = self.maxpool3(out, step='backward')
             out = self.relu3(out, step='backward')
             block1_recon = out
-            out = self.conv3(out, step='backward')  
+            out = self.conv3(out, step='backward')
             if(self.ind <= 1):
-                out = self.ins2(out) 
+                out = self.ins2(out)
                 out = self.relu2(out, step='backward')
                 out = self.conv2(out, step='backward')
             if (self.ind == 0):
-                out = self.ins1(out) 
+                out = self.ins1(out)
                 out = self.relu1(out, step='backward')
                 out = self.conv1(out, step='backward')
-            
+
         if (inter==True) and ('forward' in step):
             return out, orig_feature, block1, block2
         elif (inter_recon==True) and ('backward' in step):
@@ -139,7 +139,7 @@ class CNNF(nn.Module):
                 ff_prev = ff_current
 
         return output
-        
+
     def run_cycles_adv(self, data):
         data = data.cuda()
         self.reset()
@@ -170,7 +170,18 @@ class CNNF(nn.Module):
         for i in range(len(output_list)):
             totaloutput += output_list[i]
         return totaloutput / (self.cycles+1)
-    
+
+    def forward_backward_adv(self, data, inter = True):
+        # Returns original features and reconstructed
+        data = data.cuda()
+        self.reset()
+        output, orig_feature, block1_all, block2_all = self.forward(data, first=True, inter=True)
+        recon, block1_recon, block2_recon = self.forward(output, step='backward', inter_recon=True)
+
+        if inter:
+            return output, orig_feature, block1_all, block2_all, recon, block1_recon, block2_recon
+        return output, orig_feature, recon
+
     def forward_adv(self, data):
         # run the first forward pass
         data = data.cuda()

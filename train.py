@@ -34,11 +34,12 @@ def train_adv(args, model, device, train_loader, optimizer, scheduler, epoch,
     model.reset()
 
     adversary = LinfPGDAttack(
-        model, loss_fn=nn.CrossEntropyLoss(reduction="sum"), eps=args.eps, 
+        model, loss_fn=nn.CrossEntropyLoss(reduction="sum"), eps=args.eps,
         nb_iter=args.nb_iter, eps_iter=args.eps_iter, rand_init=True, clip_min=-1.0, clip_max=1.0, targeted=False)
- 
+
+    print(len(train_loader))
     for batch_idx, (images, targets) in enumerate(train_loader):
-            
+
         optimizer.zero_grad()
         images = images.cuda()
         targets = targets.cuda()
@@ -48,31 +49,30 @@ def train_adv(args, model, device, train_loader, optimizer, scheduler, epoch,
             adv_images = adversary.perturb(images, targets)
 
         images_all = torch.cat((images, adv_images), 0)
-              
+
         # Reset the model latent variables
-        model.reset() 
+        model.reset()
         if (args.dataset == 'cifar10'):
             logits, orig_feature_all, block1_all, block2_all, block3_all = model(images_all, first=True, inter=True)
         elif (args.dataset == 'fashion'):
             logits, orig_feature_all, block1_all, block2_all = model(images_all, first=True, inter=True)
         ff_prev = orig_feature_all
-        # find the original feature of clean images
+        # f1 the original feature of clean images
         orig_feature, _ = torch.split(orig_feature_all, images.size(0))
         block1_clean, _ = torch.split(block1_all, images.size(0))
         block2_clean, _ = torch.split(block2_all, images.size(0))
         if (args.dataset == 'cifar10'):
             block3_clean, _ = torch.split(block3_all, images.size(0))
         logits_clean, logits_adv = torch.split(logits, images.size(0))
-        
+
         if not ('no' in clean):
             loss = (clean_parameter * F.cross_entropy(logits_clean, targets) + F.cross_entropy(logits_adv, targets)) / (2*(cycles+1))
-        else:        
-            loss = F.cross_entropy(logits_adv, targets) / (cycles+1) 
-
+        else:
+            loss = F.cross_entropy(logits_adv, targets) / (cycles+1)
         for i_cycle in range(cycles):
             if (args.dataset == 'cifar10'):
                 recon, block1_recon, block2_recon, block3_recon = model(logits, step='backward', inter_recon=True)
-            elif (args.dataset == 'fashion'):    
+            elif (args.dataset == 'fashion'):
                 recon, block1_recon, block2_recon = model(logits, step='backward', inter_recon=True)
             recon_clean, recon_adv = torch.split(recon, images.size(0))
             recon_block1_clean, recon_block1_adv = torch.split(block1_recon, images.size(0))
@@ -83,17 +83,79 @@ def train_adv(args, model, device, train_loader, optimizer, scheduler, epoch,
             elif (args.dataset == 'fashion'):
                 loss += (F.mse_loss(recon_adv, orig_feature) + F.mse_loss(recon_block1_adv, block1_clean) + F.mse_loss(recon_block2_adv, block2_clean)) * mse_parameter / (3*cycles)
 
-            # feedforward    
+            # feedforward
             ff_current = ff_prev + args.res_parameter * (recon - ff_prev)
             logits = model(ff_current, first=False)
             ff_prev = ff_current
-            logits_clean, logits_adv = torch.split(logits, images.size(0)) 
+            logits_clean, logits_adv = torch.split(logits, images.size(0))
             if not ('no' in clean):
                 loss += (clean_parameter * F.cross_entropy(logits_clean, targets) + F.cross_entropy(logits_adv, targets)) / (2*(cycles+1))
             else:
-                loss += F.cross_entropy(logits_adv, targets) / (cycles+1) 
-            
+                loss += F.cross_entropy(logits_adv, targets) / (cycles+1)
+
         pred = logits_clean.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+        correct += pred.eq(targets.view_as(pred)).sum().item()
+
+        loss.backward()
+        if (args.grad_clip):
+            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+        scheduler.step()
+        train_loss += loss
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(images[0]), len(train_loader.dataset),
+                100. * batch_idx / len(train_loader), loss.item()))
+    train_loss /= len(train_loader)
+    acc = correct / len(train_loader.dataset)
+    return train_loss, acc
+
+def train(args, model, device, train_loader, optimizer, scheduler, epoch,
+          cycles, mse_parameter=1.0, clean_parameter=1.0,clean="no"):
+
+    model.train()
+
+    correct = 0
+    train_loss = 0.0
+
+    model.reset()
+
+    for batch_idx, (images, targets) in enumerate(train_loader):
+
+        optimizer.zero_grad()
+        images = images.cuda()
+        targets = targets.cuda()
+
+        model.reset()
+
+        # Reset the model latent variables
+        model.reset()
+        if (args.dataset == 'cifar10'):
+            logits, orig_feature, block1, block2, block3 = model(images, first=True, inter=True)
+        elif (args.dataset == 'fashion'):
+            logits, orig_feature_all, block1, block2 = model(images, first=True, inter=True)
+        ff_prev = orig_feature
+        # find the original feature of clean images
+
+        loss = F.cross_entropy(logits, targets) / (cycles+1)
+        for i_cycle in range(cycles):
+            if (args.dataset == 'cifar10'):
+                recon, block1_recon, block2_recon, block3_recon = model(logits, step='backward', inter_recon=True)
+            elif (args.dataset == 'fashion'):
+                recon, block1_recon, block2_recon = model(logits, step='backward', inter_recon=True)
+
+            if (args.dataset == 'cifar10'):
+                loss += (F.mse_loss(recon, orig_feature) + F.mse_loss(block1_recon, block1) + F.mse_loss(block2_recon, block2) + F.mse_loss(block3_recon, block3)) * mse_parameter / (4*cycles)
+            elif (args.dataset == 'fashion'):
+                loss += (F.mse_loss(recon, orig_feature) + F.mse_loss(block1_recon, block1) + F.mse_loss(block2_recon, block2)) * mse_parameter / (3*cycles)
+
+            # feedforward
+            ff_current = ff_prev + args.res_parameter * (recon - ff_prev)
+            logits = model(ff_current, first=False)
+            ff_prev = ff_current
+            loss += F.cross_entropy(logits, targets) / (cycles+1)
+
+        pred = logits.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
         correct += pred.eq(targets.view_as(pred)).sum().item()
 
         loss.backward()
@@ -114,7 +176,7 @@ def test(args, model, device, test_loader, cycles, epoch):
     model.eval()
     test_loss = 0
     correct = 0
-    
+
     noise_loss = 0
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(test_loader):
@@ -131,10 +193,10 @@ def test(args, model, device, test_loader, cycles, epoch):
                 ff_current = ff_prev + args.res_parameter * (recon - ff_prev)
                 output = model(ff_current, first=False)
 
-            test_loss += F.cross_entropy(output, target, reduction='sum').item() 
-            pred = output.argmax(dim=1, keepdim=True)  
+            test_loss += F.cross_entropy(output, target, reduction='sum').item()
+            pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
-            
+
     test_loss /= len(test_loader.dataset)
 
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
@@ -144,11 +206,11 @@ def test(args, model, device, test_loader, cycles, epoch):
     return test_loss, correct / len(test_loader.dataset)
 
 def test_pgd(args, model, device, test_loader, epsilon=0.063):
-    
+
     model.eval()
-    model.reset()        
+    model.reset()
     adversary = LinfPGDAttack(
-        model.forward_adv, loss_fn=nn.CrossEntropyLoss(reduction="sum"), eps=epsilon, 
+        model.forward_adv, loss_fn=nn.CrossEntropyLoss(reduction="sum"), eps=epsilon,
         nb_iter=args.nb_iter, eps_iter=args.eps_iter, rand_init=True, clip_min=-1.0, clip_max=1.0, targeted=False)
 
     correct = 0
@@ -160,7 +222,7 @@ def test_pgd(args, model, device, test_loader, epsilon=0.063):
 
         output = model.run_cycles(adv_images)
 
-        pred = output.argmax(dim=1, keepdim=True) 
+        pred = output.argmax(dim=1, keepdim=True)
         correct += pred.eq(target.view_as(pred)).sum().item()
 
     acc = correct / len(test_loader.dataset)
@@ -187,16 +249,16 @@ def main():
     parser.add_argument('--grad-clip', action='store_true', default=False,
                         help='enable gradient clipping')
     parser.add_argument('--dataset', choices=['cifar10', 'fashion'],
-                        default='cifar10', help='the dataset for training the model')
-    parser.add_argument('--schedule', choices=['poly', 'cos'],
+                        default='fashion', help='the dataset for training the model')
+    parser.add_argument('--schedule', choices=['poly', 'cos', 'stepLR'],
                         default='poly', help='scheduling for learning rate')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=400, metavar='N',
+    parser.add_argument('--log-interval', type=int, default=1, metavar='N',
                         help='how many batches to wait before logging training status')
-    
+
     # adversarial training parameters
     parser.add_argument('--eps', type=float, default=0.063,
                         help='Perturbation magnitude for adv training')
@@ -205,8 +267,8 @@ def main():
     parser.add_argument('--nb_iter', type=int, default=7,
                         help='number of steps in pgd attack')
     parser.add_argument('--clean', choices=['no', 'supclean'],
-                        default='supclean', help='whether to use clean data in adv training')
-    
+                        default='no', help='whether to use clean data in adv training')
+
     # hyper-parameters
     parser.add_argument('--mse-parameter', type=float, default=1.0,
                         help='weight of the reconstruction loss')
@@ -214,7 +276,7 @@ def main():
                         help='weight of the clean Xentropy loss')
     parser.add_argument('--res-parameter', type=float, default=0.1,
                         help='step size for residuals')
-    
+
     # model parameters
     parser.add_argument('--layers', default=40, type=int, help='total number of layers for WRN')
     parser.add_argument('--widen-factor', default=2, type=int, help='Widen factor for WRN')
@@ -223,40 +285,40 @@ def main():
                         help='index of the intermediate layer to reconstruct to')
     parser.add_argument('--max-cycles', type=int, default=2,
                         help='the maximum cycles that the CNN-F uses')
-    parser.add_argument('--save-model', default=None,
+    parser.add_argument('--save-model', default="model", # None
                         help='Name for Saving the current Model')
-    parser.add_argument('--model-dir', default=None,
+    parser.add_argument('--model-dir', default="runs", # None
                         help='Directory for Saving the current Model')
 
-    
+
     args = parser.parse_args()
- 
+
     if not os.path.exists(args.model_dir):
         os.makedirs(args.model_dir)
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
-    
-    seed_torch(args.seed) 
-    
+
+    seed_torch(args.seed)
+
     Tensor_writer = SummaryWriter(os.path.join(args.model_dir, args.save_model))
 
     train_transform_cifar = transforms.Compose(
       [transforms.RandomHorizontalFlip(),
        transforms.RandomCrop(32, padding=4),
        transforms.ToTensor(),
-       transforms.Normalize([0.5] * 3, [0.5] * 3)])      
-    
+       transforms.Normalize([0.5] * 3, [0.5] * 3)])
+
     test_transform_cifar = transforms.Compose(
       [transforms.ToTensor(),
        transforms.Normalize([0.5] * 3, [0.5] * 3)])
-    
+
     transform_mnist = transforms.Compose(
       [transforms.ToTensor(),
-       transforms.Normalize((0.5,), (0.5,))])  
+       transforms.Normalize((0.5,), (0.5,))])
 
-    # Load datasets and architecture                   
+    # Load datasets and architecture
     if args.dataset == 'fashion':
         train_loader = torch.utils.data.DataLoader(
             datasets.FashionMNIST('data', train=True, download=True,
@@ -267,7 +329,7 @@ def main():
             batch_size=args.test_batch_size, shuffle=True, drop_last=True)
         num_classes = 10
         model = CNNF(num_classes, ind=args.ind, cycles=args.max_cycles, res_param=args.res_parameter).to(device)
-        
+
     elif args.dataset == 'cifar10':
         train_data = datasets.CIFAR10(
             'data', train=True, transform=train_transform_cifar, download=True)
@@ -281,16 +343,18 @@ def main():
           shuffle=True, num_workers=4, pin_memory=True)
         num_classes = 10
         model = WideResNet(args.layers, 10, args.widen_factor, args.droprate, args.ind, args.max_cycles, args.res_parameter).to(device)
-    
+
     optimizer = torch.optim.SGD(
           model.parameters(),
           args.lr,
           momentum=args.momentum,
           weight_decay=args.wd)
-            
-    if(args.schedule == 'cos'):        
+
+    if(args.schedule == 'cos'):
         scheduler = torch.optim.lr_scheduler.LambdaLR(
           optimizer, lr_lambda=lambda step: get_lr(step, args.epochs * len(train_loader), 1.0, 1e-5))
+    elif(args.schedule == 'stepLR'):
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
     else:
         scheduler = torch.optim.lr_scheduler.LambdaLR(
           optimizer, lr_lambda=lambda step: lr_poly(1.0, step, args.epochs * len(train_loader), args.power))
@@ -298,12 +362,12 @@ def main():
     # Begin training
     best_acc = 0
 
-    for epoch in range(args.epochs):    
-        train_loss, train_acc = train_adv(args, model, device, train_loader, optimizer, scheduler, epoch, 
+    for epoch in range(args.epochs):
+        train_loss, train_acc = train(args, model, device, train_loader, optimizer, scheduler, epoch,
           cycles=args.max_cycles, mse_parameter=args.mse_parameter, clean_parameter=args.clean_parameter, clean=args.clean)
 
         test_loss, test_acc = test(args, model, device, test_loader, cycles=args.max_cycles, epoch=epoch)
-        
+
         Tensor_writer.add_scalars('loss', {'train': train_loss}, epoch)
         Tensor_writer.add_scalars('acc', {'train': train_acc}, epoch)
 
@@ -316,11 +380,11 @@ def main():
             experiment_fn = args.save_model
             torch.save(model.state_dict(),
                        args.model_dir + "/{}-best.pt".format(experiment_fn))
-                        
+
         if ((epoch+1)%50)==0 and args.save_model is not None:
             experiment_fn = args.save_model
             torch.save(model.state_dict(),
-                       args.model_dir + "/{}-epoch{}.pt".format(experiment_fn,epoch))   
+                       args.model_dir + "/{}-epoch{}.pt".format(experiment_fn,epoch))
             pgd_acc = test_pgd(args, model, device, test_loader, epsilon=args.eps)
 
             Tensor_writer.add_scalars('pgd_acc', {'test': pgd_acc}, epoch)
